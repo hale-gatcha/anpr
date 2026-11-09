@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.streamlit/secrets.toml
+
+results/*
+!results/.keep
+samples/*
+!samples/.keep
+tests/test_images/*
+!tests/test_images/.keep
