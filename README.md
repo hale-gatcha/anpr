@@ -7,9 +7,9 @@ A Digital Image Processing project (SA1 Learning Evidence). The user uploads a p
 ## What it does
 
 1. Accepts JPG, JPEG or PNG images and rejects invalid or unreadable files.
-2. Preprocesses the image (resize, grayscale, noise filtering, contrast boost when needed, Canny edges, morphological closing).
+2. Preprocesses the image (resize, grayscale, bilateral filtering, CLAHE, adaptive Canny/Sobel/morphology edge maps and scale-aware closing).
 3. Locates the plate with contour detection, shape filtering and a character-row check, then draws a bounding box and crops the plate.
-4. Cleans the crop and reads it with Tesseract OCR, reporting a confidence value and warnings.
+4. Reads up to three scored candidates with multiple classical threshold variants and Tesseract page segmentation modes.
 5. Shows everything in a Streamlit web interface that runs locally.
 
 ## Technology
@@ -60,15 +60,26 @@ python -m streamlit run app.py
 
 Tesseract OCR must be installed separately (see `docs/installation.md`).
 
+## User interface
+
+The Streamlit interface uses a Philippine plate-inspired green theme, with an upload preview, plate-style OCR result, confidence and format indicators, annotated and cropped images, and expandable detection/OCR processing steps. Use the sidebar to switch the plate display style or show the processing gallery. The result can be downloaded as an annotated JPG and a small JSON file.
+
+Screenshots:
+
+![Plate Reader upload and preview](docs/images/plate-reader-upload.png)
+
+![Plate Reader result and processing steps](docs/images/plate-reader-result.png)
+
 ## How it works
 
 ```
 Photo -> resize -> grayscale -> bilateral filter -> CLAHE (only if low contrast)
-      -> Canny edges -> morphological closing (3 widths) -> contours
+      -> auto-Canny + Sobel-X + blackhat/tophat -> scale-aware morphological closing
       -> filter by shape and size -> score (shape, size, position, character row)
-      -> best region -> bounding box + crop
-      -> upscale -> keep character row -> Otsu threshold -> remove non-characters
-      -> Tesseract (restricted A-Z/0-9) + Tesseract (unrestricted, for reliability)
+      -> top three candidates -> candidate score + OCR format/confidence ranking
+      -> illumination normalization -> blur estimate / conditional deconvolution -> upscale
+      -> Otsu, adaptive Gaussian, Sauvola, CLAHE/Otsu and sharpened/Otsu variants
+      -> Tesseract (PSM 7/8/13, restricted A-Z/0-9)
       -> pattern check -> plate text + warnings
 ```
 
@@ -79,13 +90,13 @@ Why each technique was chosen is explained in `docs/implementation_plan.md` and 
 - **Blur, low resolution, glare, heavy shadow and steep angles** reduce detection and OCR quality. A blurred plate in our own tests was not found correctly.
 - **Cluttered backgrounds**: text, grilles or stickers can look like a plate. The character-row check reduces, but does not remove, this problem.
 - **Tesseract is built for documents, not plates.** Similar characters (0/O/G, 1/I, 8/B, 5/S) are confused on small or blurry plates.
-- **The pattern correction assumes a car format** (3 letters + 3-4 digits; current Philippine car plates are 3 letters + 4 digits). Motorcycle plates use other layouts, so on those the correction can change a correct read. The raw OCR text is always shown next to the corrected text for this reason.
+- **Car-format correction is conditional** (3 letters + 3-4 digits; current Philippine car plates are 3 letters + 4 digits). Other alphanumeric layouts, including motorcycle and registration plates, are retained without position-based correction and are warned when they do not match the car pattern.
 - **Single plate, single line**: the system returns one plate per image and one text line.
 - The confidence and agreement values are rough indicators chosen heuristically, not measured accuracy.
 
 ## Testing
 
-`tests/evaluate.py` runs the real pipeline on your test images and computes detection rate, exact-match rate and character accuracy, separately for raw and corrected text. See `docs/test_plan.md`.
+`tests/evaluate.py` runs the real pipeline on `samples/` by default. It scores known labels from filenames such as `plate_NGJ391.jpg` and the supplied `car1.jpg` known case; add labels to `tests/ground_truth.csv` for a meaningful set-wide accuracy figure.
 
 ## Documentation
 

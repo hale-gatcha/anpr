@@ -86,8 +86,14 @@ def find_char_row(gray, extend=False):
     if gray is None or gray.size == 0:
         return 0, None
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Local adaptive thresholding recovers strokes under uneven light and blur.
+    block = max(3, (min(gray.shape) // 5) | 1)
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, block, 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
     best, best_comps = [], []
-    for mask in (binary, cv2.bitwise_not(binary)):
+    for mask in (binary, cv2.bitwise_not(binary), adaptive, cv2.bitwise_not(adaptive)):
         group, comps = _row_in_mask(mask)
         if len(group) > len(best):
             best, best_comps = group, comps

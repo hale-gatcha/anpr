@@ -261,7 +261,7 @@ def summarize(results_path):
 def main():
     ap = argparse.ArgumentParser(description="Evaluate the ANPR pipeline.")
     ap.add_argument("--truth", default=os.path.join(ROOT, "tests", "ground_truth.csv"))
-    ap.add_argument("--images", default=os.path.join(ROOT, "tests", "test_images"))
+    ap.add_argument("--images", default=os.path.join(ROOT, "samples"))
     ap.add_argument("--out", default=os.path.join(ROOT, "results"))
     ap.add_argument("--summary-only", action="store_true",
                     help="skip running; re-summarize the existing results CSV")
@@ -272,6 +272,32 @@ def main():
         if not os.path.isfile(args.truth):
             print(f"Cannot find {args.truth}")
             return
+        truth = read_csv(args.truth)
+        if not truth:
+            # Filename convention: plate_<EXPECTED>.jpg; car1 is the supplied known case.
+            truth = []
+            known = {
+                "car1": "NGJ391",
+                "car2": "AAO8074",
+                "lto_plate_number": "AHA8208",
+                "car5": "PYX186",
+            }
+            for filename in sorted(os.listdir(args.images)):
+                stem, ext = os.path.splitext(filename)
+                if ext.lower() not in (".jpg", ".jpeg", ".png"):
+                    continue
+                expected = known.get(stem.lower(), "")
+                if not expected and "_" in stem:
+                    expected = stem.rsplit("_", 1)[1]
+                truth.append({"image_id": stem, "filename": filename,
+                              "category": "", "expected_plate": expected})
+            print("Using sample images; expected text comes from the filename or known cases.")
+            temp_truth = os.path.join(args.out, "sample_ground_truth.csv")
+            os.makedirs(args.out, exist_ok=True)
+            with open(temp_truth, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["image_id","filename","category","expected_plate"])
+                writer.writeheader(); writer.writerows(truth)
+            args.truth = temp_truth
         if not run_all(args.truth, args.images, args.out, results_path):
             return
     if not os.path.isfile(results_path):
