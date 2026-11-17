@@ -3,4 +3,7 @@ numpy>=1.24
 Pillow>=10.0
 pytesseract>=0.3.10
 streamlit>=1.30
-scikit-image>=0.22
+# Optional: Sauvola thresholding; the OCR path falls back to adaptive thresholding.
+# scikit-image>=0.22
+scikit-learn>=1.3
+joblib>=1.3

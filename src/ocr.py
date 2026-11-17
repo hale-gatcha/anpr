@@ -14,10 +14,14 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 import pytesseract
-from skimage.filters import threshold_sauvola
+try:
+    from skimage.filters import threshold_sauvola
+except ImportError:  # optional; adaptive Gaussian thresholding remains available
+    threshold_sauvola = None
 
 from .characters import find_char_row
 from . import preprocessing as pp
+from anpr.char_classifier import classify_character, normalize_glyph
 
 WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 MIN_AGREEMENT = 0.6     # heuristic: below this the two OCR passes disagree too much
@@ -56,6 +60,7 @@ class OCRResult:
     steps: dict = field(default_factory=dict)
     winning_variant: str = ""
     vote_table: list = field(default_factory=list)
+    separators: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- cleanup
@@ -163,6 +168,97 @@ def _crop_to_character_row(gray):
     return gray[y0:y1, x0:x1], (x0, y0, x1 - x0, y1 - y0), count
 
 
+def _legacy_yellow_character_cells(row_gray):
+    """Use connected components and vertical projection valleys to separate a dirty, dashed yellow plate row."""
+    if row_gray is None or row_gray.size == 0 or row_gray.shape[1] < 100:
+        return [], None, None
+    height, width = row_gray.shape[:2]
+    band_h = max(32, int(.58 * height))
+    band = row_gray[:band_h, :]
+    _, binary = cv2.threshold(band, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    foreground = cv2.bitwise_not(binary)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(foreground, connectivity=8)
+    char_height = .9 * band_h
+    separators = []
+    for x, y, w, h, area in stats[1:]:
+        center_y = y + h / 2
+        if (.05 * char_height <= h <= .25 * char_height
+                and .10 * char_height <= w <= .4 * char_height
+                and .35 * width <= x + w / 2 <= .62 * width
+                and .2 * char_height <= center_y <= .75 * char_height):
+            separators.append((int(x), int(y), int(w), int(h)))
+    separator = min(separators, key=lambda item: abs(item[0] + item[2]/2 - .5*width)) if separators else None
+
+    projection = foreground.sum(axis=0).astype(np.float32) / 255.0
+    smooth = cv2.GaussianBlur(projection.reshape(1, -1), (1, 9), 0).ravel()
+    tall_components = [(int(x), int(x+w)) for x, y, w, h, area in stats[1:]
+                       if h >= .5 * band_h and area >= 10
+                       and x > .04 * width and x + w < .96 * width]
+    if tall_components:
+        span_start = min(item[0] for item in tall_components)
+        span_end = max(item[1] for item in tall_components)
+    else:
+        margin = int(.05 * width)
+        search = smooth[margin:width-margin]
+        on = np.where(search > .20 * max(1.0, float(search.max())))[0]
+        if len(on) < 20:
+            return [], separator, None
+        span_start = int(on[0] + margin)
+        span_end = int(on[-1] + margin + 1)
+    if separator is None:
+        # Without a physical dash, use the widest projection valley near the group boundary.
+        mid = (span_start + span_end) // 2
+        lo, hi = max(span_start + 1, mid - 12), min(span_end - 1, mid + 13)
+        sep_x = lo + int(np.argmin(smooth[lo:hi]))
+        sep_end = sep_x
+        separator = (sep_x, int(.42*band_h), 0, max(1, int(.12*band_h)))
+    else:
+        sep_x, _, sep_w, _ = separator
+        sep_end = sep_x + sep_w
+    left_end = max(span_start + 3, separator[0] - 2)
+    right_start = min(span_end - 3, sep_end + 3)
+    if left_end <= span_start or right_start >= span_end:
+        return [], separator, None
+
+    def group_bounds(start, end, count):
+        cuts = [start]
+        nominal = (end - start) / count
+        for index in range(1, count):
+            target = start + nominal * index
+            radius = max(3, int(.16 * nominal))
+            lo = max(start + 1, int(target - radius))
+            hi = min(end - 1, int(target + radius))
+            cuts.append(lo + int(np.argmin(smooth[lo:hi+1])))
+        cuts.append(end)
+        return list(zip(cuts, cuts[1:]))
+
+    cells = group_bounds(span_start, left_end, 3) + group_bounds(right_start, span_end, 3)
+    outputs = []
+    debug = cv2.cvtColor(row_gray, cv2.COLOR_GRAY2BGR)
+    for x0, x1 in cells:
+        if x1 - x0 < 5:
+            return [], separator, None
+        cell = band[:, x0:x1]
+        ink = foreground[:, x0:x1]
+        count, _, component_stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        useful = []
+        for cx, cy, cw, ch, area in component_stats[1:]:
+            if ch >= .28 * band_h and area >= 5:
+                useful.append((cx, cy, cw, ch))
+        if useful:
+            x_min = max(0, min(item[0] for item in useful) - 2)
+            x_max = min(cell.shape[1], max(item[0] + item[2] for item in useful) + 2)
+            y_min = max(0, min(item[1] for item in useful) - 2)
+            y_max = min(cell.shape[0], max(item[1] + item[3] for item in useful) + 2)
+            cell = cell[y_min:y_max, x_min:x_max]
+        outputs.append(cell)
+        cv2.rectangle(debug, (x0, 0), (x1, band_h), (0, 255, 0), 1)
+    if separator is not None:
+        x, y, w, h = separator
+        cv2.rectangle(debug, (x, y), (x + max(2, w), y + max(2, h)), (255, 0, 255), 2)
+    return outputs, separator, debug
+
+
 def _crop_yellow_plate(plate_bgr):
     """Use HSV color segmentation to isolate a yellow plate before OCR."""
     hsv = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2HSV)
@@ -179,6 +275,40 @@ def _crop_yellow_plate(plate_bgr):
     pad = max(2, int(0.08 * h))
     return plate_bgr[max(0, y - pad):min(plate_bgr.shape[0], y + h + pad),
                      max(0, x - pad):min(plate_bgr.shape[1], x + w + pad)]
+
+
+def _deskew_by_projection(gray):
+    """Estimate residual italic shear by maximizing vertical projection-profile variance."""
+    _, base = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    height, width = base.shape
+    center = (height - 1) / 2.0
+
+    def profile_score(binary):
+        band = binary[int(0.08 * height):max(int(0.92 * height), 1), :]
+        projection = band.sum(axis=0).astype(np.float32) / max(1, band.shape[0])
+        # Valley contrast complements variance so separated glyphs are favored.
+        smooth = cv2.GaussianBlur(projection.reshape(1, -1), (1, 5), 0).ravel()
+        valleys = np.count_nonzero((smooth[1:-1] <= smooth[:-2]) &
+                                   (smooth[1:-1] <= smooth[2:]) &
+                                   (smooth[1:-1] < 0.45 * max(1.0, smooth.max())))
+        return float(np.var(projection) + valleys * max(1.0, projection.max()) ** 2 / width)
+
+    best_score, best_shear, best_gray = profile_score(base), 0.0, gray
+    for shear in np.arange(-0.5, 0.5001, 0.05):
+        if abs(shear) < 1e-6:
+            continue
+        matrix = np.float32([[1.0, shear, -shear * center], [0.0, 1.0, 0.0]])
+        warped = cv2.warpAffine(gray, matrix, (width, height),
+                                flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=255)
+        _, binary = cv2.threshold(warped, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        score = profile_score(binary)
+        if score > best_score:
+            best_score, best_shear, best_gray = score, float(shear), warped
+    if best_shear and (abs(best_shear) < 0.15 or best_score < profile_score(base) * 1.20):
+        return gray, 0.0
+    return best_gray, best_shear
 
 
 def _yellow_plate_read(plate_bgr):
@@ -332,7 +462,7 @@ def _split_components(binary, row_height):
         key=lambda item: item[0])
 
 
-def _character_ocr(image, position, return_details=False):
+def _character_ocr(image, position, return_details=False, classifier_image=None):
     """Use single-character Tesseract classification with position constraints."""
     whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if position < 3 else "0123456789"
     data = pytesseract.image_to_data(
@@ -344,19 +474,39 @@ def _character_ocr(image, position, return_details=False):
         if (text and math.isfinite(float(confidence))
                 and float(confidence) >= 0):
             candidates.append((text[0], float(confidence)))
-    if not candidates:
-        return ("", 0.0, {}) if return_details else ("", 0.0)
-    result = max(candidates, key=lambda item: item[1])
-    details = {"tesseract": result[0], "overridden": False}
+    result = max(candidates, key=lambda item: item[1]) if candidates else ("", 0.0)
+    classifier_char, classifier_probability = classify_character(
+        image if classifier_image is None else classifier_image, position
+    )
+    char, confidence = result
+    details = {
+        "tesseract": char,
+        "classifier": classifier_char,
+        "classifier_confidence": round(classifier_probability * 100.0, 1),
+        "disagreement": bool(char and classifier_char and char != classifier_char),
+        "overridden": False,
+    }
+    if classifier_char:
+        # Weighted voting is conservative: high-confidence classifier evidence can resolve a glyph,
+        # while disagreements lower confidence and remain visible in the UI table.
+        if (not char or (classifier_probability >= 0.98
+                         and classifier_probability * 100.0 >= confidence + 25.0)):
+            char = classifier_char
+            details["overridden"] = bool(result[0] and result[0] != char)
+        if confidence <= 0:
+            confidence = classifier_probability * 100.0
+    if not char:
+        return ("", 0.0, details) if return_details else ("", 0.0)
     if position >= 3 and result[0] in "0689ODQU":
         zero_score, six_score, features = _classify_zero_or_six(image)
-        if result[0] == "6" and zero_score > six_score + 0.20:
-            details.update(features, overridden=result[0] != "0")
-            return ("0", max(result[1], 70.0), details) if return_details else (
-                "0", max(result[1], 70.0)
+        if (result[0] == "6" and classifier_probability < 0.75
+                and zero_score > six_score + 0.20):
+            details.update(features, overridden=char != "0")
+            return ("0", max(confidence, 70.0), details) if return_details else (
+                "0", max(confidence, 70.0)
             )
         details.update(features)
-    return (result[0], result[1], details) if return_details else result
+    return (char, confidence, details) if return_details else (char, confidence)
 
 
 def _looks_like_zero(image):
@@ -471,15 +621,29 @@ def _segment_variant(binary, row_height):
 def prepare_plate_for_ocr(plate_bgr):
     """Use row geometry, local thresholds and morphology to build OCR variants."""
     steps = {}
+    input_h = plate_bgr.shape[0]
+    if input_h < 120:
+        scale_up = 120.0 / max(1, input_h)
+        plate_bgr = cv2.resize(plate_bgr, None, fx=scale_up, fy=scale_up,
+                               interpolation=cv2.INTER_CUBIC)
+    steps["ocr0_upscaled_input"] = plate_bgr
     plate_bgr = _crop_yellow_plate(plate_bgr)
+    source_gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+    source_gray, residual_shear = _deskew_by_projection(source_gray)
+    steps["ocr0_de_sheared"] = source_gray
+    steps["ocr_shear_coefficient"] = np.full(
+        (32, 120), int((residual_shear + 0.5) * 255), np.uint8)
     h, w = plate_bgr.shape[:2]
     # 1. Upscale: Tesseract works best when characters are ~30+ px tall
-    scale = max(1.0, 70.0 / h)
-    big = cv2.resize(plate_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    scale = max(1.0, 120.0 / h)
+    if residual_shear:
+        big = cv2.resize(source_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        big_color = cv2.resize(plate_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        big = cv2.cvtColor(big_color, cv2.COLOR_BGR2GRAY)
     steps["ocr1_upscaled"] = big
     # 2. Grayscale + light denoise
-    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(pp.normalize_illumination(gray), (3, 3), 0)
+    gray = cv2.GaussianBlur(pp.normalize_illumination(big), (3, 3), 0)
     steps["ocr2_gray"] = gray
     # 3. Crop tightly around the row of characters BEFORE thresholding.
     #    Otsu picks one threshold for the whole image, so a dark bumper bar
@@ -510,10 +674,12 @@ def prepare_plate_for_ocr(plate_bgr):
     variants["otsu"] = otsu
     variants["adaptive"] = adaptive
     try:
+        if threshold_sauvola is None:
+            raise ImportError("scikit-image is optional")
         window = max(3, (min(gray.shape)//5)|1)
         sau = (gray > threshold_sauvola(gray, window_size=window, k=0.2)).astype(np.uint8)*255
         variants["sauvola"] = sau
-    except (ValueError, RuntimeError):
+    except (ImportError, ValueError, RuntimeError):
         pass
     clahe = cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8)).apply(gray)
     _, variants["clahe_otsu"] = cv2.threshold(clahe,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -545,7 +711,7 @@ def _is_plausible_plate_text(text):
 # marked '?' instead (see correct_with_pattern).
 _TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8"}
 _AMBIGUOUS_IN_DIGITS = {"G"}
-_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G"}
+_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "7": "Z", "8": "B", "6": "G"}
 
 
 def correct_with_pattern(text):
@@ -591,7 +757,39 @@ def read_plate(plate_bgr):
 
     variants, steps = prepare_plate_for_ocr(plate_bgr)
     variant_readings = []
+    whole_row_readings = []
     classifier_features = []
+    classifier_character_details = []
+    separators = []
+    hsv_plate = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2HSV)
+    yellow_mask = ((hsv_plate[:, :, 0] >= 15) & (hsv_plate[:, :, 0] <= 35)
+                   & (hsv_plate[:, :, 1] >= 80) & (hsv_plate[:, :, 2] >= 100))
+    if float(yellow_mask.mean()) >= .08:
+        cells, separator, debug = _legacy_yellow_character_cells(
+            steps.get("ocr3_horizontal_crop", steps.get("ocr2_gray")))
+        if separator is not None:
+            separators.append({"box": tuple(map(int, separator)), "kind": "group separator"})
+        if len(cells) == 6:
+            steps["segments_legacy_yellow"] = debug
+            chars, confidences = [], []
+            character_debug = cv2.cvtColor(debug.copy(), cv2.COLOR_BGR2GRAY)
+            for position, cell in enumerate(cells):
+                glyph = normalize_glyph(cell)
+                enlarged = cv2.resize(glyph, (80, 120), interpolation=cv2.INTER_CUBIC)
+                enlarged = cv2.copyMakeBorder(enlarged, 18, 18, 18, 18,
+                                               cv2.BORDER_CONSTANT, value=255)
+                char, confidence, details = _character_ocr(
+                    enlarged, position, True, classifier_image=glyph
+                )
+                chars.append(char); confidences.append(confidence)
+                if details.get("classifier"):
+                    classifier_character_details.append({
+                        "position": position + 1, "variant": "legacy_yellow_projection",
+                        **details,
+                    })
+            if all(chars):
+                variant_readings.append(("legacy_yellow_projection", "".join(chars), confidences))
+                steps["characters_legacy_yellow"] = steps.get("ocr4_binary", character_debug)
     for name, prepared in variants.items():
         segments = _segment_variant(prepared, max(1, prepared.shape[0] // 3))
         if len(segments) not in (6, 7):
@@ -606,6 +804,12 @@ def read_plate(plate_bgr):
             char, confidence, details = _character_ocr(
                 crop, position, return_details=True
             )
+            if details.get("classifier"):
+                classifier_character_details.append({
+                    "position": position + 1,
+                    "variant": name,
+                    **details,
+                })
             chars.append(char)
             confidences.append(confidence)
             if details.get("overridden"):
@@ -631,8 +835,23 @@ def read_plate(plate_bgr):
             steps[f"characters_{name}"] = prepared
             steps[f"segments_{name}"] = debug
 
+    # Whole-row PSM 7 readings keep a useful independent vote when slanted glyphs
+    # are split imperfectly by connected-component segmentation.
+    for name in ("otsu_normal", "adaptive_normal", "sauvola_normal", "sharpened_otsu_normal"):
+        prepared = variants.get(name)
+        if prepared is None:
+            continue
+        text, confidence = _ocr_pass(
+            prepared, "--psm 7 --oem 3 -c tessedit_char_whitelist=" + WHITELIST)
+        text = re.sub(r"[^A-Z0-9]", "", text.upper())
+        if len(text) in (6, 7) and text.isalnum():
+            normalized = correct_with_pattern(text)
+            if _CAR_PATTERN.fullmatch(normalized):
+                whole_row_readings.append((normalized, max(confidence, 65.0), text))
+
     if variant_readings:
-        width = len(variant_readings[0][1])
+        width = Counter(len(item[1]) for item in variant_readings).most_common(1)[0][0]
+        variant_readings = [item for item in variant_readings if len(item[1]) == width]
         vote_table = []
         chosen = []
         chosen_confidences = []
@@ -667,6 +886,22 @@ def read_plate(plate_bgr):
                 vote_table[feature["position"] - 1].setdefault(
                     "classifier", feature
                 )
+        penalized_positions = set()
+        for feature in classifier_character_details:
+            position = feature["position"] - 1
+            if position < len(vote_table):
+                if feature.get("disagreement") and position not in penalized_positions:
+                    chosen_confidences[position] *= 0.75
+                    vote_table[position]["confidence"] = round(
+                        vote_table[position]["confidence"] * 0.75, 1)
+                    penalized_positions.add(position)
+                vote_table[position].update({
+                    "tesseract_guess": feature.get("tesseract", ""),
+                    "classifier_guess": feature.get("classifier", ""),
+                    "final_choice": chosen[position],
+                    "character_confidence": feature.get("classifier_confidence", 0.0),
+                    "disagreement": feature.get("disagreement", False),
+                })
         raw = "".join(chosen)
         line_resistant = {
             text for name, text, _ in variant_readings
@@ -729,7 +964,25 @@ def read_plate(plate_bgr):
         )
         agreement = confidence / 100.0
 
-    corrected = _pattern_window(raw, confidence)
+    line_counts = Counter(item[0] for item in whole_row_readings)
+    line_consensus, consensus_count = max(line_counts.items(), key=lambda item: item[1], default=("", 0))
+    has_letter_lookalike = any(
+        any(char in "72" for char in raw_text[:3])
+        for _, _, raw_text in whole_row_readings
+    )
+    use_line_consensus = consensus_count >= 2 and has_letter_lookalike
+    if use_line_consensus:
+        raw = line_consensus
+        corrected = line_consensus
+        confidence = float(np.mean([score for text, score, _ in whole_row_readings
+                                    if text == line_consensus]))
+        agreement = consensus_count / max(1, len(whole_row_readings))
+        for position, char in enumerate(line_consensus):
+            if position < len(vote_table):
+                vote_table[position]["winner"] = char
+                vote_table[position]["final_choice"] = char
+                vote_table[position]["whole_row_consensus"] = True
+    corrected = line_consensus if use_line_consensus else _pattern_window(raw, confidence)
     fmt_ok = bool(_CAR_PATTERN.fullmatch(corrected)
                   or _is_plausible_plate_text(corrected))
     winning_base = winning.split("_psm", 1)[0]
@@ -755,7 +1008,8 @@ def read_plate(plate_bgr):
     return OCRResult(True, raw_text=raw, text=corrected, confidence=confidence,
                      agreement=agreement, format_ok=fmt_ok, steps=steps,
                      message=" ".join(notes) or "OCR completed.",
-                     winning_variant=winning, vote_table=vote_table)
+                     winning_variant=winning, vote_table=vote_table,
+                     separators=separators)
 
 
 def _pattern_window(raw, confidence):

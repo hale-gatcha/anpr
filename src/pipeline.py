@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 import math
 from typing import Optional
 
+import numpy as np
+
 from .detection import DetectionResult, detect_plate
 from .ocr import OCRResult, read_plate
 
@@ -39,7 +41,7 @@ def run_pipeline(image_bgr):
         return PipelineResult(detection=detection)
     candidates = detection.candidates or [{"score": 1.0, "crop": detection.plate_crop, "box": detection.box}]
     best_detection = candidates[0].get("score", 0.0)
-    eligible = [c for c in candidates if c.get("score", 0.0) >= 0.65 * best_detection]
+    eligible = [c for c in candidates if c.get("score", 0.0) >= 0.80 * best_detection]
     readings = []
     for candidate in eligible:
         ocr_result = read_plate(candidate["crop"])
@@ -68,10 +70,21 @@ def run_pipeline(image_bgr):
     # Main detection fields always describe the selected OCR candidate.
     detection.box = candidate.get("box", detection.box)
     detection.plate_crop = candidate["crop"]
+    if candidate.get("polygon") is not None:
+        detection.polygon = candidate["polygon"]
+        detection.polygon_original = candidate["polygon"] * np.array([
+            image_bgr.shape[1] / detection.annotated.shape[1],
+            image_bgr.shape[0] / detection.annotated.shape[0],
+        ], dtype=np.float32)
+        detection.rectified_crop = candidate.get("rectified_crop")
     detection.annotated = detection.annotated.copy()
     x,y,w,h=detection.box
     import cv2
-    cv2.rectangle(detection.annotated,(x,y),(x+w,y+h),(0,255,0),3)
+    if detection.polygon is not None:
+        cv2.polylines(detection.annotated, [detection.polygon.astype(np.int32)],
+                      True, (0,255,0), 3)
+    else:
+        cv2.rectangle(detection.annotated,(x,y),(x+w,y+h),(0,255,0),3)
     alternatives = [{"text": r.text, "raw_text": r.raw_text, "score": s,
                      "detection_score": c.get("score",0.0), "confidence": r.confidence}
                     for s,c,r in readings[1:]]

@@ -12,7 +12,7 @@ from src.pipeline import run_pipeline
 from src.utils import decode_image_bytes
 
 
-st.set_page_config(page_title="Plate Reader", page_icon="🚘", layout="wide")
+st.set_page_config(page_title="ANPR", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
@@ -130,8 +130,11 @@ if file_key and st.session_state.get("plate_result_key") == file_key:
                         st.write("Other candidate readings:")
                         st.dataframe(result.alternatives, hide_index=True, use_container_width=True)
                     if ocr.vote_table:
-                        st.write("Per-character OCR votes:")
+                        st.write("Per-character reading and confidence:")
                         st.dataframe(ocr.vote_table, hide_index=True, use_container_width=True)
+                    if ocr.separators:
+                        st.write("Detected group separator:")
+                        st.dataframe(ocr.separators, hide_index=True, use_container_width=True)
             else:
                 render_plate("", [], plate_style, 0)
                 if ocr is not None and ocr.message:
@@ -146,9 +149,26 @@ if file_key and st.session_state.get("plate_result_key") == file_key:
                     st.image(to_rgb(detection.annotated), use_container_width=True)
                     st.markdown('</div>', unsafe_allow_html=True)
                 with right:
-                    st.markdown('<div class="image-card"><div class="image-title">Plate crop</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="image-card"><div class="image-title">Rectified plate crop</div>', unsafe_allow_html=True)
                     st.image(to_rgb(detection.plate_crop), use_container_width=True)
                     st.markdown('</div>', unsafe_allow_html=True)
+                if ocr is not None and ocr.steps:
+                    deskew = ocr.steps.get("ocr0_de_sheared")
+                    binary = ocr.steps.get("ocr4_binary")
+                    boxed = next((value for key, value in ocr.steps.items()
+                                  if key.startswith("segments_")), None)
+                    if deskew is not None or binary is not None or boxed is not None:
+                        st.markdown("#### Character processing")
+                        detail_cols = st.columns(3, gap="large")
+                        for col, title, image_data in zip(
+                            detail_cols,
+                            ("De-sheared plate", "Binarized character row", "Character boxes"),
+                            (deskew, binary, boxed),
+                        ):
+                            if image_data is not None:
+                                with col:
+                                    st.caption(title)
+                                    st.image(to_rgb(image_data), use_container_width=True)
                 if detection.message:
                     st.caption(detection.message)
             elif image is not None:

@@ -27,6 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 
 from src.pipeline import run_pipeline  # noqa: E402
 from src.utils import load_image, save_image  # noqa: E402
@@ -152,6 +153,10 @@ def run_all(truth_path, images_dir, out_dir, results_path):
     for item in truth:
         print(f"Running {item['image_id']} ({item['filename']}) ...")
         row = evaluate_one(item, images_dir, out_dir)
+        predicted = row.get("corrected_ocr", "")
+        expected = row.get("expected_plate", "")
+        status = "PASS" if expected and normalize(predicted) == normalize(expected) else "FAIL"
+        print(f"  expected={expected or '(unlabeled)':<10} predicted={predicted or '(none)':<10} {status}")
         prev = old.get(item["image_id"], {})
         row["detection_ok"] = prev.get("detection_ok", "")
         row["observations"] = prev.get("observations", "")
@@ -159,6 +164,39 @@ def run_all(truth_path, images_dir, out_dir, results_path):
     write_csv(results_path, rows)
     print(f"\nPer-image results written to {results_path}")
     return True
+
+
+def synthetic_warp_check(images_dir, attempts=50, seed=42):
+    """Apply random homographies to the full car3 photo and evaluate the full pipeline."""
+    path = os.path.join(images_dir, "car3.jpg")
+    image = load_image(path)
+    h, w = image.shape[:2]
+    src = np.float32([[0,0],[w-1,0],[w-1,h-1],[0,h-1]])
+    rng = np.random.default_rng(seed)
+    correct = 0
+    expected = "HVU253"  # Actual local car3.jpg; the requested CAX3200 image is absent.
+    for index in range(attempts):
+        angle = float(rng.uniform(-5, 5))
+        shear = float(rng.uniform(-0.10, 0.10))
+        affine = cv2.getRotationMatrix2D((w/2, h/2), angle, float(rng.uniform(.85,1.1)))
+        affine[0,1] += shear
+        moved = cv2.transform(src.reshape(1,-1,2), affine).reshape(4,2)
+        jitter = rng.uniform(-.03, .03, (4,2)).astype(np.float32) * np.array([w,h],np.float32)
+        dst = moved + jitter
+        # Fit the transformed quadrilateral inside the output canvas so the test
+        # measures recognition under slant, not accidental character cropping.
+        low, high = dst.min(axis=0), dst.max(axis=0)
+        span = np.maximum(high - low, 1.0)
+        fit = min(.94 * w / span[0], .94 * h / span[1])
+        dst = (dst - low) * fit + np.array([.03*w, .03*h], np.float32)
+        warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(src, dst), (w,h),
+                                     flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        result = run_pipeline(warped)
+        reading = result.ocr
+        predicted = normalize(reading.text) if reading and reading.ok else ""
+        correct += int(predicted == expected)
+        print(f"  warp {index+1:02d}/{attempts}: {predicted or '(none)'} {'PASS' if predicted==expected else 'FAIL'}")
+    print(f"Synthetic car3 warp accuracy: {100.0*correct/attempts:.1f}% ({correct}/{attempts}); expected {expected} from the local image.")
 
 
 # ---------------------------------------------------------- summarizing
@@ -265,6 +303,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "results"))
     ap.add_argument("--summary-only", action="store_true",
                     help="skip running; re-summarize the existing results CSV")
+    ap.add_argument("--synthetic-warps", action="store_true",
+                    help="also run 50 random perspective/shear/rotation warps of car3's plate crop")
     args = ap.parse_args()
 
     results_path = os.path.join(args.out, "evaluation_results.csv")
@@ -279,6 +319,10 @@ def main():
             known = {
                 "car1": "NGJ391",
                 "car2": "AAO8074",
+                # The supplied workspace image car3.jpg visibly reads HVU253.
+                # The requested CAX3200 sample is not present in this checkout.
+                "car3": "HVU253",
+                "car4": "LZT1209",
                 "lto_plate_number": "AHA8208",
                 "car5": "PYX186",
             }
@@ -300,6 +344,8 @@ def main():
             args.truth = temp_truth
         if not run_all(args.truth, args.images, args.out, results_path):
             return
+    if args.synthetic_warps:
+        synthetic_warp_check(args.images)
     if not os.path.isfile(results_path):
         print("No results file yet. Run without --summary-only first.")
         return
